@@ -1,4 +1,3 @@
-
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -78,7 +77,9 @@ wide = wide.loc[:, ~wide.columns.duplicated()].copy()
 long = long.loc[:, ~long.columns.duplicated()].copy()
 pop_month = pop_month.loc[:, ~pop_month.columns.duplicated()].copy()
 
-# --- Helpers ---
+# =========================
+# Helpers
+# =========================
 def card(title, value, sub=""):
     st.markdown(
         f'''
@@ -114,8 +115,6 @@ def top_split(df, metric, n=5):
     return inc, dec
 
 def build_report_html(title, subtitle, figs, tables):
-    # figs: list of (fig_title, plotly_fig)
-    # tables: list of (table_title, dataframe)
     parts = []
     parts.append(f"<h1 style='font-family:system-ui; margin:0 0 6px;'>{title}</h1>")
     parts.append(f"<p style='font-family:system-ui; margin:0 0 18px; opacity:.8;'>{subtitle}</p>")
@@ -126,6 +125,145 @@ def build_report_html(title, subtitle, figs, tables):
         parts.append(f"<h2 style='font-family:system-ui; margin:18px 0 8px;'>{t}</h2>")
         parts.append(df.to_html(index=False))
     return "<html><head><meta charset='utf-8'></head><body style='margin:24px;'>" + "\n".join(parts) + "</body></html>"
+
+# =========================
+# ✅ 핵심 수정: pop_month에서 강원/전북 coalesce 후
+#           pop_year 재계산 → 의료요약과 결합 → wide/long 재생성
+# =========================
+def coalesce_region_monthly(df: pd.DataFrame, left: str, right: str, keep: str) -> pd.DataFrame:
+    """
+    left/right 두 지역이 동시에 있을 때:
+    같은 (year, month)에서 값이 있으면 left 우선, 없으면 right 사용하여 keep으로 합침.
+    """
+    df = df.copy()
+
+    if "sido" not in df.columns:
+        raise ValueError("pop_month에 'sido' 컬럼이 필요합니다.")
+    if "year" not in df.columns or "month" not in df.columns:
+        raise ValueError("pop_month에 'year', 'month' 컬럼이 필요합니다.")
+    if "pop_change" not in df.columns:
+        raise ValueError("pop_month에 'pop_change' 컬럼이 필요합니다.")
+    # pop_end가 없을 수도 있으니(예외 방어) 있으면 같이 합침
+    has_end = "pop_end" in df.columns
+
+    a = df[df["sido"] == left].copy()
+    b = df[df["sido"] == right].copy()
+
+    if len(a) == 0 and len(b) == 0:
+        return df
+
+    # 둘 중 하나만 있으면 이름만 keep으로 통일
+    if len(a) == 0:
+        df.loc[df["sido"] == right, "sido"] = keep
+        return df
+    if len(b) == 0:
+        df.loc[df["sido"] == left, "sido"] = keep
+        return df
+
+    # merge by year, month
+    key_cols = ["year", "month"]
+    cols_a = ["pop_change"] + (["pop_end"] if has_end else [])
+    cols_b = ["pop_change"] + (["pop_end"] if has_end else [])
+
+    ab = a[key_cols + cols_a].merge(b[key_cols + cols_b], on=key_cols, how="outer", suffixes=("_a", "_b"))
+
+    # coalesce: a 우선, 없으면 b
+    ab["pop_change"] = ab["pop_change_a"].where(ab["pop_change_a"].notna(), ab["pop_change_b"])
+    if has_end:
+        ab["pop_end"] = ab["pop_end_a"].where(ab["pop_end_a"].notna(), ab["pop_end_b"])
+
+    ab["sido"] = keep
+    ab = ab[["sido"] + key_cols + ["pop_end", "pop_change"] if has_end else ["sido"] + key_cols + ["pop_change"]]
+
+    # 원본에서 left/right 제거 후 keep 추가
+    df2 = df[~df["sido"].isin([left, right])].copy()
+    df2 = pd.concat([df2, ab], ignore_index=True)
+
+    return df2
+
+def build_population_year_from_month(df_month: pd.DataFrame) -> pd.DataFrame:
+    # 연도별 인구증감 합(=sum), 평균인구(=pop_end mean) 계산
+    if "pop_end" in df_month.columns:
+        out = (
+            df_month.groupby(["sido", "year"], as_index=False)
+            .agg(
+                pop_change_year=("pop_change", "sum"),
+                pop_avg_year=("pop_end", "mean"),
+            )
+        )
+    else:
+        out = (
+            df_month.groupby(["sido", "year"], as_index=False)
+            .agg(
+                pop_change_year=("pop_change", "sum"),
+                pop_avg_year=("pop_change", lambda x: np.nan),  # fallback
+            )
+        )
+    return out
+
+def build_medical_year_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
+    # long 파일에서 의료 연도요약(=sum)만 뽑아 사용
+    needed = ["sido", "year", "patients_year", "claims_year", "amount_year"]
+    for c in needed:
+        if c not in df_long.columns:
+            raise ValueError(f"compare_2023_2024_long.csv에 '{c}' 컬럼이 필요합니다.")
+    out = (
+        df_long.groupby(["sido", "year"], as_index=False)
+        .agg(
+            patients_year=("patients_year", "sum"),
+            claims_year=("claims_year", "sum"),
+            amount_year=("amount_year", "sum"),
+        )
+    )
+    return out
+
+def rebuild_all(wide_in, long_in, pop_month_in):
+    # 1) pop_month coalesce
+    pm = pop_month_in.copy()
+
+    # 숫자 타입 보정
+    for c in ["pop_change", "pop_end"]:
+        if c in pm.columns:
+            pm[c] = pd.to_numeric(pm[c], errors="coerce")
+
+    # ✅ 강원/전북 통합
+    pm = coalesce_region_monthly(pm, "강원도", "강원특별자치도", "강원특별자치도")
+    pm = coalesce_region_monthly(pm, "전라북도", "전북특별자치도", "전북특별자치도")
+
+    # 2) pop_year 재계산
+    py = build_population_year_from_month(pm)
+
+    # 3) 의료 year 요약은 long에서 재추출
+    my = build_medical_year_from_long(long_in)
+
+    # 4) 결합 long 재생성
+    merged = py.merge(my, on=["sido", "year"], how="inner")
+    merged["patients_per_1k"] = merged["patients_year"] / merged["pop_avg_year"] * 1000
+    merged["amount_per_capita"] = merged["amount_year"] / merged["pop_avg_year"]
+
+    # 5) wide 재생성
+    w = merged.pivot(index="sido", columns="year", values=[
+        "pop_change_year", "pop_avg_year",
+        "patients_year", "claims_year", "amount_year",
+        "patients_per_1k", "amount_per_capita"
+    ]).reset_index()
+    w.columns = ["sido"] + [f"{a}_{b}" for a, b in w.columns[1:]]
+
+    # delta
+    w["delta_pop_change"] = w["pop_change_year_2024"] - w["pop_change_year_2023"]
+    w["delta_patients_per_1k"] = w["patients_per_1k_2024"] - w["patients_per_1k_2023"]
+    w["delta_amount_per_capita"] = w["amount_per_capita_2024"] - w["amount_per_capita_2023"]
+    w["delta_amount_total"] = w["amount_year_2024"] - w["amount_year_2023"]
+
+    # safety
+    w = w.loc[:, ~w.columns.duplicated()].copy()
+    merged = merged.loc[:, ~merged.columns.duplicated()].copy()
+    pm = pm.loc[:, ~pm.columns.duplicated()].copy()
+
+    return w, merged, pm
+
+# ✅ 여기서 전체를 재생성하여 강원 2023 1~6월 누락 등 자동 해결
+wide, long_rebuilt, pop_month = rebuild_all(wide, long, pop_month)
 
 # --- Metrics/Themes (Δ = 2024 - 2023) ---
 THEMES = {
@@ -153,7 +291,6 @@ st.sidebar.markdown("### ⭐ 관심 지역")
 fav_pick = st.sidebar.multiselect("관심 지역 선택", options=all_sidos, default=st.session_state["favorites"])
 st.session_state["favorites"] = fav_pick
 
-# quick add/remove
 with st.sidebar.expander("빠른 추가/삭제", expanded=False):
     quick = st.selectbox("시도 선택", all_sidos, index=0, key="quick_sido")
     c_add, c_rm = st.columns(2)
@@ -181,7 +318,7 @@ with c4:
 st.markdown("---")
 
 tab_home, tab_rel, tab_quad, tab_map, tab_detail = st.tabs(
-    ["🏠 메인", "📈 관계", "🧭 사분면", "🗺️ 지도", "📅 시도 상세"]
+    ["🏠 메인", "📈 관계", "🧭 4분면 분석", "🗺️ 지도", "📅 시도 상세"]
 )
 
 # ---------------- Home: top 증가/감소 5 per theme ----------------
@@ -189,7 +326,6 @@ with tab_home:
     st.markdown('<div class="section-title">테마별 상위 지역 (증가 / 감소)</div>', unsafe_allow_html=True)
     st.markdown('<div class="small">기준: 변화량(2024 − 2023). 증가=큰 값, 감소=작은 값</div>', unsafe_allow_html=True)
 
-    # Special: per theme show two charts (increase/decrease)
     for key, (tname, unit) in THEMES.items():
         st.markdown(f"**{tname}** <span class='small'>({unit})</span>", unsafe_allow_html=True)
         inc, dec = top_split(wide, key, n=5)
@@ -203,6 +339,7 @@ with tab_home:
             )
             fig_inc.update_layout(height=320, margin=dict(l=10,r=10,t=40,b=10), xaxis_title="", yaxis_title="")
             st.plotly_chart(fig_inc, use_container_width=True)
+
         with colB:
             fig_dec = px.bar(
                 dec.sort_values(key, ascending=True),
@@ -215,19 +352,12 @@ with tab_home:
 
         st.markdown("---")
 
-    # Favorites section
     st.markdown('<div class="section-title">관심 지역</div>', unsafe_allow_html=True)
     if len(st.session_state["favorites"]) == 0:
         st.info("왼쪽 사이드바에서 관심 지역을 선택하면 여기에서 요약을 볼 수 있어요.")
     else:
         fav = wide[wide["sido"].isin(st.session_state["favorites"])].copy()
-        show_cols = [
-            "sido",
-            "delta_pop_change",
-            "delta_patients_per_1k",
-            "delta_amount_per_capita",
-            "delta_amount_total",
-        ]
+        show_cols = ["sido", "delta_pop_change", "delta_patients_per_1k", "delta_amount_per_capita", "delta_amount_total"]
         st.dataframe(fav[show_cols].sort_values("delta_amount_per_capita", ascending=False), use_container_width=True)
 
     st.markdown('<div class="section-title">전체 표</div>', unsafe_allow_html=True)
@@ -254,9 +384,7 @@ with tab_rel:
         st.caption(f"상관계수 r = {r:.2f} (단순선형 기준)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Report export (HTML)
     st.markdown('<div class="section-title">내보내기</div>', unsafe_allow_html=True)
-    # Create a compact table for the report
     rep_table = wide[["sido", x_key, y_key]].sort_values(y_key, ascending=False).head(10).copy()
     html = build_report_html(
         title="2023–2024 비교 리포트",
@@ -272,9 +400,9 @@ with tab_rel:
         use_container_width=True,
     )
 
-# ---------------- Quadrants ----------------
+# ---------------- 4분면 분석(한글) ----------------
 with tab_quad:
-    st.markdown('<div class="section-title">사분면으로 관심 지역 찾기</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">4분면 분석으로 관심 지역 찾기</div>', unsafe_allow_html=True)
     st.markdown('<div class="small">기준선: 선택한 분할 기준(중앙값/평균)</div>', unsafe_allow_html=True)
 
     x_key = st.selectbox("X(분할)", ["delta_pop_change", "delta_patients_per_1k"], index=0, key="q_x")
@@ -285,41 +413,40 @@ with tab_quad:
     x_cut = df[x_key].median() if basis.startswith("중앙") else df[x_key].mean()
     y_cut = df[y_key].median() if basis.startswith("중앙") else df[y_key].mean()
 
-    df["quadrant"] = np.select(
+    df["구역"] = np.select(
         [
             (df[x_key] >= x_cut) & (df[y_key] >= y_cut),
             (df[x_key] <  x_cut) & (df[y_key] >= y_cut),
             (df[x_key] <  x_cut) & (df[y_key] <  y_cut),
             (df[x_key] >= x_cut) & (df[y_key] <  y_cut),
         ],
-        ["Q1: X↑/Y↑", "Q2: X↓/Y↑", "Q3: X↓/Y↓", "Q4: X↑/Y↓"],
+        ["1사분면(X↑·Y↑)", "2사분면(X↓·Y↑)", "3사분면(X↓·Y↓)", "4사분면(X↑·Y↓)"],
         default="",
     )
 
-    fig = px.scatter(df, x=x_key, y=y_key, color="quadrant", hover_name="sido",
-                     title="사분면 분류", template="plotly_white")
+    fig = px.scatter(df, x=x_key, y=y_key, color="구역", hover_name="sido",
+                     title="4분면 분류", template="plotly_white")
     fig.add_vline(x=float(x_cut))
     fig.add_hline(y=float(y_cut))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.markdown('<div class="section-title">Q2: X↓ / Y↑ 지역</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-title">2사분면(X↓·Y↑) 지역</div>', unsafe_allow_html=True)
     cols = uniq_cols(["sido", x_key, y_key, "delta_amount_per_capita", "delta_patients_per_1k", "delta_pop_change"])
-    q2 = df[df["quadrant"].str.startswith("Q2")][cols].copy()
+    q2 = df[df["구역"].str.startswith("2사분면")][cols].copy()
     st.dataframe(q2.sort_values(y_key, ascending=False), use_container_width=True)
 
-    # Export: a one-page HTML summary including quadrants + table
     st.markdown('<div class="section-title">내보내기</div>', unsafe_allow_html=True)
     q2_top = q2.sort_values(y_key, ascending=False).head(10).copy()
     html = build_report_html(
-        title="2023–2024 사분면 요약",
+        title="2023–2024 4분면 요약",
         subtitle=f"분할: {THEMES.get(x_key,(x_key,''))[0]} × {THEMES.get(y_key,(y_key,''))[0]} (Δ=2024−2023)",
-        figs=[("사분면 산점도", fig)],
-        tables=[("Q2 상위 10개 지역(표)", q2_top)],
+        figs=[("4분면 산점도", fig)],
+        tables=[("2사분면 상위 10개 지역(표)", q2_top)],
     )
     st.download_button(
-        "사분면 요약(HTML) 다운로드",
+        "4분면 요약(HTML) 다운로드",
         data=html.encode("utf-8"),
-        file_name="quadrant_summary_2023_2024.html",
+        file_name="four_quadrant_summary_2023_2024.html",
         mime="text/html",
         use_container_width=True,
     )
@@ -329,7 +456,6 @@ with tab_map:
     st.markdown('<div class="section-title">지역 분포 보기</div>', unsafe_allow_html=True)
     st.markdown('<div class="small">지도는 시도 대표 좌표(대략)에 표시됩니다.</div>', unsafe_allow_html=True)
 
-    # Representative coordinates (approx)
     coords = {
         "서울특별시": (37.5665, 126.9780),
         "부산광역시": (35.1796, 129.0756),
@@ -380,7 +506,6 @@ with tab_map:
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown('<div class="section-title">내보내기</div>', unsafe_allow_html=True)
-    # lightweight export: table + map snapshot as HTML (interactive map)
     tbl = df[["sido", color_metric, size_metric]].sort_values(color_metric, ascending=False).head(10).copy()
     html = build_report_html(
         title="2023–2024 지도 요약",
@@ -411,7 +536,6 @@ with tab_detail:
     fig.update_layout(xaxis_title="", yaxis_title="인구증감(명)", height=420)
     st.plotly_chart(fig, use_container_width=True)
 
-    # show key deltas for selected
     row = wide[wide["sido"]==selected].iloc[0]
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -438,5 +562,7 @@ with tab_detail:
     )
 
 st.markdown("---")
-st.caption("※ 환자수/명세서건수는 의료행위별 통계를 시도 단위로 합산한 값이라 '고유 인원'과 다를 수 있습니다. "
-           "비교·탐색 목적의 지표로 활용하세요.")
+st.caption(
+    "※ 환자수/명세서건수는 의료행위별 통계를 시도 단위로 합산한 값이라 '고유 인원'과 다를 수 있습니다. "
+    "비교·탐색 목적의 지표로 활용하세요."
+)

@@ -78,6 +78,41 @@ long = long.loc[:, ~long.columns.duplicated()].copy()
 pop_month = pop_month.loc[:, ~pop_month.columns.duplicated()].copy()
 
 # =========================
+# ✅ 핵심 보정(여기만 보면 됨): 강원/전북이 항상 뜨도록 표준화 + 월별 통합
+# =========================
+def normalize_sido(s):
+    if not isinstance(s, str):
+        return s
+    s = s.strip()
+    if s == "강원도":
+        return "강원특별자치도"
+    if s == "전라북도":
+        return "전북특별자치도"
+    return s
+
+# pop_month 표준화
+pop_month["sido"] = pop_month["sido"].apply(normalize_sido)
+
+# 같은 (sido, year, month)가 여러 행이면 통합
+for c in ["pop_change", "pop_end"]:
+    if c in pop_month.columns:
+        pop_month[c] = pd.to_numeric(pop_month[c], errors="coerce")
+
+agg = {"pop_change": "sum"}
+if "pop_end" in pop_month.columns:
+    agg["pop_end"] = "mean"
+
+pop_month = (
+    pop_month
+    .groupby(["sido", "year", "month"], as_index=False)
+    .agg(agg)
+)
+
+# wide/long도 표준화(지도/탭 누락 방지)
+wide["sido"] = wide["sido"].apply(normalize_sido)
+long["sido"] = long["sido"].apply(normalize_sido)
+
+# =========================
 # Helpers
 # =========================
 def card(title, value, sub=""):
@@ -127,82 +162,20 @@ def build_report_html(title, subtitle, figs, tables):
     return "<html><head><meta charset='utf-8'></head><body style='margin:24px;'>" + "\n".join(parts) + "</body></html>"
 
 # =========================
-# ✅ 핵심 수정: pop_month에서 강원/전북 coalesce 후
-#           pop_year 재계산 → 의료요약과 결합 → wide/long 재생성
+# ✅ pop_month 기반으로 연간(pop_year) 재계산 → 의료와 결합 → wide 재생성
+#    (기존 compare_2023_2024_wide.csv가 조금 틀려도 여기서 바로잡힘)
 # =========================
-def coalesce_region_monthly(df: pd.DataFrame, left: str, right: str, keep: str) -> pd.DataFrame:
-    """
-    left/right 두 지역이 동시에 있을 때:
-    같은 (year, month)에서 값이 있으면 left 우선, 없으면 right 사용하여 keep으로 합침.
-    """
-    df = df.copy()
-
-    if "sido" not in df.columns:
-        raise ValueError("pop_month에 'sido' 컬럼이 필요합니다.")
-    if "year" not in df.columns or "month" not in df.columns:
-        raise ValueError("pop_month에 'year', 'month' 컬럼이 필요합니다.")
-    if "pop_change" not in df.columns:
-        raise ValueError("pop_month에 'pop_change' 컬럼이 필요합니다.")
-    # pop_end가 없을 수도 있으니(예외 방어) 있으면 같이 합침
-    has_end = "pop_end" in df.columns
-
-    a = df[df["sido"] == left].copy()
-    b = df[df["sido"] == right].copy()
-
-    if len(a) == 0 and len(b) == 0:
-        return df
-
-    # 둘 중 하나만 있으면 이름만 keep으로 통일
-    if len(a) == 0:
-        df.loc[df["sido"] == right, "sido"] = keep
-        return df
-    if len(b) == 0:
-        df.loc[df["sido"] == left, "sido"] = keep
-        return df
-
-    # merge by year, month
-    key_cols = ["year", "month"]
-    cols_a = ["pop_change"] + (["pop_end"] if has_end else [])
-    cols_b = ["pop_change"] + (["pop_end"] if has_end else [])
-
-    ab = a[key_cols + cols_a].merge(b[key_cols + cols_b], on=key_cols, how="outer", suffixes=("_a", "_b"))
-
-    # coalesce: a 우선, 없으면 b
-    ab["pop_change"] = ab["pop_change_a"].where(ab["pop_change_a"].notna(), ab["pop_change_b"])
-    if has_end:
-        ab["pop_end"] = ab["pop_end_a"].where(ab["pop_end_a"].notna(), ab["pop_end_b"])
-
-    ab["sido"] = keep
-    ab = ab[["sido"] + key_cols + ["pop_end", "pop_change"] if has_end else ["sido"] + key_cols + ["pop_change"]]
-
-    # 원본에서 left/right 제거 후 keep 추가
-    df2 = df[~df["sido"].isin([left, right])].copy()
-    df2 = pd.concat([df2, ab], ignore_index=True)
-
-    return df2
-
 def build_population_year_from_month(df_month: pd.DataFrame) -> pd.DataFrame:
-    # 연도별 인구증감 합(=sum), 평균인구(=pop_end mean) 계산
-    if "pop_end" in df_month.columns:
-        out = (
-            df_month.groupby(["sido", "year"], as_index=False)
-            .agg(
-                pop_change_year=("pop_change", "sum"),
-                pop_avg_year=("pop_end", "mean"),
-            )
+    out = (
+        df_month.groupby(["sido", "year"], as_index=False)
+        .agg(
+            pop_change_year=("pop_change", "sum"),
+            pop_avg_year=("pop_end", "mean") if "pop_end" in df_month.columns else ("pop_change", lambda x: np.nan),
         )
-    else:
-        out = (
-            df_month.groupby(["sido", "year"], as_index=False)
-            .agg(
-                pop_change_year=("pop_change", "sum"),
-                pop_avg_year=("pop_change", lambda x: np.nan),  # fallback
-            )
-        )
+    )
     return out
 
 def build_medical_year_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
-    # long 파일에서 의료 연도요약(=sum)만 뽑아 사용
     needed = ["sido", "year", "patients_year", "claims_year", "amount_year"]
     for c in needed:
         if c not in df_long.columns:
@@ -217,53 +190,27 @@ def build_medical_year_from_long(df_long: pd.DataFrame) -> pd.DataFrame:
     )
     return out
 
-def rebuild_all(wide_in, long_in, pop_month_in):
-    # 1) pop_month coalesce
-    pm = pop_month_in.copy()
+pop_year = build_population_year_from_month(pop_month)
+med_year = build_medical_year_from_long(long)
 
-    # 숫자 타입 보정
-    for c in ["pop_change", "pop_end"]:
-        if c in pm.columns:
-            pm[c] = pd.to_numeric(pm[c], errors="coerce")
+merged_long = pop_year.merge(med_year, on=["sido", "year"], how="inner")
+merged_long["patients_per_1k"] = merged_long["patients_year"] / merged_long["pop_avg_year"] * 1000
+merged_long["amount_per_capita"] = merged_long["amount_year"] / merged_long["pop_avg_year"]
 
-    # ✅ 강원/전북 통합
-    pm = coalesce_region_monthly(pm, "강원도", "강원특별자치도", "강원특별자치도")
-    pm = coalesce_region_monthly(pm, "전라북도", "전북특별자치도", "전북특별자치도")
+wide = merged_long.pivot(index="sido", columns="year", values=[
+    "pop_change_year", "pop_avg_year",
+    "patients_year", "claims_year", "amount_year",
+    "patients_per_1k", "amount_per_capita"
+]).reset_index()
 
-    # 2) pop_year 재계산
-    py = build_population_year_from_month(pm)
+wide.columns = ["sido"] + [f"{a}_{b}" for a, b in wide.columns[1:]]
 
-    # 3) 의료 year 요약은 long에서 재추출
-    my = build_medical_year_from_long(long_in)
+wide["delta_pop_change"] = wide["pop_change_year_2024"] - wide["pop_change_year_2023"]
+wide["delta_patients_per_1k"] = wide["patients_per_1k_2024"] - wide["patients_per_1k_2023"]
+wide["delta_amount_per_capita"] = wide["amount_per_capita_2024"] - wide["amount_per_capita_2023"]
+wide["delta_amount_total"] = wide["amount_year_2024"] - wide["amount_year_2023"]
 
-    # 4) 결합 long 재생성
-    merged = py.merge(my, on=["sido", "year"], how="inner")
-    merged["patients_per_1k"] = merged["patients_year"] / merged["pop_avg_year"] * 1000
-    merged["amount_per_capita"] = merged["amount_year"] / merged["pop_avg_year"]
-
-    # 5) wide 재생성
-    w = merged.pivot(index="sido", columns="year", values=[
-        "pop_change_year", "pop_avg_year",
-        "patients_year", "claims_year", "amount_year",
-        "patients_per_1k", "amount_per_capita"
-    ]).reset_index()
-    w.columns = ["sido"] + [f"{a}_{b}" for a, b in w.columns[1:]]
-
-    # delta
-    w["delta_pop_change"] = w["pop_change_year_2024"] - w["pop_change_year_2023"]
-    w["delta_patients_per_1k"] = w["patients_per_1k_2024"] - w["patients_per_1k_2023"]
-    w["delta_amount_per_capita"] = w["amount_per_capita_2024"] - w["amount_per_capita_2023"]
-    w["delta_amount_total"] = w["amount_year_2024"] - w["amount_year_2023"]
-
-    # safety
-    w = w.loc[:, ~w.columns.duplicated()].copy()
-    merged = merged.loc[:, ~merged.columns.duplicated()].copy()
-    pm = pm.loc[:, ~pm.columns.duplicated()].copy()
-
-    return w, merged, pm
-
-# ✅ 여기서 전체를 재생성하여 강원 2023 1~6월 누락 등 자동 해결
-wide, long_rebuilt, pop_month = rebuild_all(wide, long, pop_month)
+wide = wide.loc[:, ~wide.columns.duplicated()].copy()
 
 # --- Metrics/Themes (Δ = 2024 - 2023) ---
 THEMES = {

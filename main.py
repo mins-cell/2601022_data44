@@ -78,8 +78,9 @@ long = long.loc[:, ~long.columns.duplicated()].copy()
 pop_month = pop_month.loc[:, ~pop_month.columns.duplicated()].copy()
 
 # =========================
-# ✅ 핵심 보정: 강원/전북을 "합산"이 아니라 "값 있는 쪽 채택(coalesce)"로 통합
-#    -> 0으로 떨어지는 문제 방지
+# ✅ 핵심 보정: 값 우선순위(primary 우선) + 표시명(display) 통일
+#    - 강원: 강원도 우선 → 표시: 강원특별자치도
+#    - 전북: 전라북도 우선 → 표시: 전북특별자치도
 # =========================
 def to_num(x):
     return pd.to_numeric(x, errors="coerce")
@@ -88,74 +89,86 @@ for c in ["pop_change", "pop_end"]:
     if c in pop_month.columns:
         pop_month[c] = to_num(pop_month[c])
 
-def coalesce_two_sidos_monthly(df, sido_a, sido_b, keep):
+def coalesce_priority_monthly(df, primary, secondary, display):
     """
-    (year, month) 단위로 a/b를 합쳐서 keep 한 줄로 만든다.
-    우선순위: a 값이 있으면 a, 없으면 b.
+    (year, month) 단위로 primary/secondary를 합쳐 display 한 줄로 만든다.
+    우선순위: primary 값이 있으면 primary, 없으면 secondary.
     """
+    df = df.copy()
     base_cols = ["year", "month"]
     has_end = "pop_end" in df.columns
 
-    A = df[df["sido"] == sido_a].copy()
-    B = df[df["sido"] == sido_b].copy()
+    A = df[df["sido"] == primary].copy()
+    B = df[df["sido"] == secondary].copy()
 
     # 둘 다 없으면 그대로
     if len(A) == 0 and len(B) == 0:
         return df
 
-    # 하나만 있으면 이름만 keep으로 통일
+    # 하나만 있으면 이름만 display로 통일
     if len(A) == 0:
-        out = df.copy()
-        out.loc[out["sido"] == sido_b, "sido"] = keep
-        return out
+        df.loc[df["sido"] == secondary, "sido"] = display
+        return df
     if len(B) == 0:
-        out = df.copy()
-        out.loc[out["sido"] == sido_a, "sido"] = keep
-        return out
+        df.loc[df["sido"] == primary, "sido"] = display
+        return df
 
-    # (year, month)별로 하나로 만들기
-    A2 = A[["sido"] + base_cols + (["pop_end", "pop_change"] if has_end else ["pop_change"])].copy()
-    B2 = B[["sido"] + base_cols + (["pop_end", "pop_change"] if has_end else ["pop_change"])].copy()
+    A2 = A[base_cols + (["pop_end", "pop_change"] if has_end else ["pop_change"])].copy()
+    B2 = B[base_cols + (["pop_end", "pop_change"] if has_end else ["pop_change"])].copy()
 
-    # suffix 붙여서 merge
-    A2 = A2.rename(columns={"pop_change": "pop_change_a", "pop_end": "pop_end_a"} if has_end else {"pop_change": "pop_change_a"})
-    B2 = B2.rename(columns={"pop_change": "pop_change_b", "pop_end": "pop_end_b"} if has_end else {"pop_change": "pop_change_b"})
+    # suffix 붙여 merge
+    A2 = A2.rename(columns={"pop_change": "pop_change_p", "pop_end": "pop_end_p"} if has_end else {"pop_change": "pop_change_p"})
+    B2 = B2.rename(columns={"pop_change": "pop_change_s", "pop_end": "pop_end_s"} if has_end else {"pop_change": "pop_change_s"})
 
     M = A2.merge(B2, on=base_cols, how="outer")
 
-    # coalesce (a 우선, 없으면 b)
-    M["pop_change"] = M["pop_change_a"].where(M["pop_change_a"].notna(), M["pop_change_b"])
+    # ✅ primary 우선, 없으면 secondary
+    M["pop_change"] = M["pop_change_p"].where(M["pop_change_p"].notna(), M["pop_change_s"])
     if has_end:
-        M["pop_end"] = M["pop_end_a"].where(M["pop_end_a"].notna(), M["pop_end_b"])
+        M["pop_end"] = M["pop_end_p"].where(M["pop_end_p"].notna(), M["pop_end_s"])
 
-    M["sido"] = keep
+    M["sido"] = display
     keep_cols = ["sido"] + base_cols + (["pop_end", "pop_change"] if has_end else ["pop_change"])
     M = M[keep_cols].copy()
 
-    # 원본에서 a/b 제거 후 keep 추가
-    df2 = df[~df["sido"].isin([sido_a, sido_b])].copy()
+    # 원본에서 primary/secondary 제거 후 display 추가
+    df2 = df[~df["sido"].isin([primary, secondary])].copy()
     df2 = pd.concat([df2, M], ignore_index=True)
-
     return df2
 
-# ✅ 강원/전북 통합 적용 (중요: 이름을 먼저 바꾸지 말고, coalesce로 만든 다음 keep으로 통일)
-pop_month = coalesce_two_sidos_monthly(pop_month, "강원특별자치도", "강원도", "강원특별자치도")
-pop_month = coalesce_two_sidos_monthly(pop_month, "전북특별자치도", "전라북도", "전북특별자치도")
+# ✅ 전북 명칭이 "전라북도특별자치도" 같은 형태로 들어오는 케이스까지 처리(별칭 통합)
+def normalize_sido_alias(s):
+    if not isinstance(s, str):
+        return s
+    s = s.strip()
+    if s in ["전라북도특별자치도", "전북특별자치도"]:
+        return "전북특별자치도"
+    if s in ["강원특별자치도"]:
+        return "강원특별자치도"
+    return s
 
-# 혹시 같은 (sido,year,month)가 남아있으면 정리 (sum이 아니라 coalesce 후라 중복 거의 없음)
+pop_month["sido"] = pop_month["sido"].apply(normalize_sido_alias)
+
+# ✅ 강원: 강원도 우선 → 표시명 강원특별자치도
+pop_month = coalesce_priority_monthly(pop_month, primary="강원도", secondary="강원특별자치도", display="강원특별자치도")
+
+# ✅ 전북: 전라북도 우선 → 표시명 전북특별자치도
+pop_month = coalesce_priority_monthly(pop_month, primary="전라북도", secondary="전북특별자치도", display="전북특별자치도")
+
+# 혹시 같은 (sido,year,month)가 남아있으면 정리
 agg = {"pop_change": "sum"}
 if "pop_end" in pop_month.columns:
     agg["pop_end"] = "mean"
 pop_month = pop_month.groupby(["sido", "year", "month"], as_index=False).agg(agg)
 
-# wide/long의 sido도 통일 (표기 일관성)
+# wide/long의 sido도 표시명 기준으로 통일(표기 일관성)
 def normalize_sido(s):
     if not isinstance(s, str):
         return s
     s = s.strip()
     if s == "강원도":
         return "강원특별자치도"
-    if s == "전라북도":
+    if s in ["전라북도", "전라북도특별자치도", "전북특별자치도"]:
         return "전북특별자치도"
     return s
 
@@ -273,8 +286,7 @@ THEMES = {
 st.markdown("## 2023–2024 시도별 인구증감과 의료이용 비교")
 st.markdown('<span class="pill">연도 비교</span><span class="pill">시도 단위</span><span class="pill">관계 분석</span>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="hint">메인 화면에서 테마별 상위 지역(증가/감소)을 빠르게 확인하고, '
-    '탭에서 관계, 지도, 시도별 월별 추이를 자세히 볼 수 있어요.</div>',
+    '<div class="hint">강원/전북은 원자료의 기존 명칭(강원도·전라북도)을 우선 사용하고, 화면 표기는 최신 명칭으로 통일했습니다.</div>',
     unsafe_allow_html=True
 )
 
